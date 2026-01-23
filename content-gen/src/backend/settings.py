@@ -6,8 +6,6 @@ Includes brand guidelines as solution parameters for content strategy
 and compliance validation.
 """
 
-import json
-import logging
 import os
 from typing import List, Optional
 
@@ -255,9 +253,15 @@ class _BrandGuidelinesSettings(BaseSettings):
 ### Content Restrictions
 - Prohibited words: {', '.join(self.prohibited_words) if self.prohibited_words else 'None specified'}
 - Required disclosures: {', '.join(self.required_disclosures) if self.required_disclosures else 'None required'}
-- Maximum headline length: {self.max_headline_length} characters
-- Maximum body length: {self.max_body_length} characters
+- Maximum headline length: approximately {self.max_headline_length} characters (headline field only)
+- Maximum body length: approximately {self.max_body_length} characters (body field only, NOT including headline or tagline)
 - CTA required: {'Yes' if self.require_cta else 'No'}
+
+**IMPORTANT: Character Limit Guidelines**
+- Character limits apply to INDIVIDUAL fields: headline, body, and tagline are counted SEPARATELY
+- The body limit ({self.max_body_length} chars) applies ONLY to the body/description text, not the combined content
+- Do NOT flag character limit issues as ERROR - use WARNING severity since exact counting may vary
+- When in doubt about length, do NOT flag it as a violation - focus on content quality instead
 
 ### Visual Guidelines
 - Primary brand color: {self.primary_color}
@@ -314,6 +318,14 @@ When generating images:
 - Do not generate images depicting violence, weapons, or harmful activities
 - Avoid culturally insensitive or appropriative imagery
 
+**IMPORTANT - Photorealistic Product Images Are ACCEPTABLE:**
+Photorealistic style for PRODUCT photography (e.g., paint cans, products, room scenes, textures) 
+is our standard marketing style and should NOT be flagged as a violation. Only flag photorealistic 
+content when it involves:
+- Fake/deepfake identifiable real people (SEVERITY: ERROR)
+- Misleading contexts designed to deceive consumers (SEVERITY: ERROR)
+Do NOT flag photorealistic product shots, room scenes, or marketing imagery as violations.
+
 ### Compliance Validation
 The Compliance Agent MUST flag any content that violates these RAI principles as SEVERITY: ERROR.
 RAI violations are non-negotiable and content must be regenerated.
@@ -329,8 +341,9 @@ Write content that embodies these characteristics:
 - Voice: {self.voice}
 
 ### Writing Rules
-- Keep headlines under {self.max_headline_length} characters
-- Keep body copy under {self.max_body_length} characters
+- Keep headlines under approximately {self.max_headline_length} characters
+- Keep body copy (description) under approximately {self.max_body_length} characters
+- Note: Character limits are approximate guidelines - focus on concise, impactful writing
 - {'Always include a clear call-to-action' if self.require_cta else 'CTA is optional'}
 - NEVER use these words: {', '.join(self.prohibited_words) if self.prohibited_words else 'No restrictions'}
 - Include these disclosures when applicable: {', '.join(self.required_disclosures) if self.required_disclosures else 'None required'}
@@ -358,6 +371,18 @@ ALWAYS ensure:
     def get_image_generation_prompt(self) -> str:
         """Generate brand guidelines for image content generation."""
         return f"""
+## ⚠️ MANDATORY: ZERO TEXT IN IMAGE
+
+THE GENERATED IMAGE MUST NOT CONTAIN ANY TEXT WHATSOEVER:
+- ❌ NO product names (do not write "Snow Veil", "Cloud Drift", or any paint name)
+- ❌ NO color names (do not write "white", "blue", "gray", etc.)
+- ❌ NO words, letters, numbers, or typography of any kind
+- ❌ NO labels, captions, signage, or watermarks
+- ❌ NO logos or brand names
+- ✓ ONLY visual elements: paint swatches, color samples, textures, scenes
+
+This is a strict requirement. Text will be added separately by the application.
+
 ## Brand Visual Guidelines
 
 Create images that follow these guidelines:
@@ -369,6 +394,13 @@ Create images that follow these guidelines:
 - Clean composition with 30% negative space
 - No competitor products or logos
 - Diverse representation if people are shown
+
+## Color Accuracy
+
+When product colors are specified (especially with hex codes):
+- Reproduce the exact colors as accurately as possible
+- Use the hex codes as the definitive color reference
+- Ensure paint/product colors match the descriptions precisely
 
 ## Responsible AI - Image Generation Rules
 

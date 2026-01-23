@@ -8,7 +8,7 @@ Provides async operations for:
 """
 
 import logging
-from typing import Any, List, Optional
+from typing import List, Optional
 from datetime import datetime, timezone
 
 from azure.cosmos.aio import CosmosClient, ContainerProxy
@@ -340,7 +340,8 @@ class CosmosDBService:
         
         item = {
             "id": conversation_id,
-            "user_id": user_id,
+            "userId": user_id,            # Partition key field (matches container definition /userId)
+            "user_id": user_id,           # Keep for backward compatibility
             "messages": messages,
             "brief": brief.model_dump() if brief else None,
             "metadata": metadata or {},
@@ -373,12 +374,16 @@ class CosmosDBService:
         conversation = await self.get_conversation(conversation_id, user_id)
         
         if conversation:
+            # Ensure userId is set (for partition key) - migrate old documents
+            if not conversation.get("userId"):
+                conversation["userId"] = conversation.get("user_id") or user_id
             conversation["generated_content"] = generated_content
             conversation["updated_at"] = datetime.now(timezone.utc).isoformat()
         else:
             conversation = {
                 "id": conversation_id,
-                "user_id": user_id,
+                "userId": user_id,            # Partition key field
+                "user_id": user_id,           # Keep for backward compatibility
                 "messages": [],
                 "generated_content": generated_content,
                 "updated_at": datetime.now(timezone.utc).isoformat()
@@ -409,12 +414,16 @@ class CosmosDBService:
         conversation = await self.get_conversation(conversation_id, user_id)
         
         if conversation:
+            # Ensure userId is set (for partition key) - migrate old documents
+            if not conversation.get("userId"):
+                conversation["userId"] = conversation.get("user_id") or user_id
             conversation["messages"].append(message)
             conversation["updated_at"] = datetime.now(timezone.utc).isoformat()
         else:
             conversation = {
                 "id": conversation_id,
-                "user_id": user_id,
+                "userId": user_id,            # Partition key field
+                "user_id": user_id,          # Keep for backward compatibility
                 "messages": [message],
                 "updated_at": datetime.now(timezone.utc).isoformat()
             }
@@ -431,7 +440,7 @@ class CosmosDBService:
         Get all conversations for a user with summary data.
         
         Args:
-            user_id: User ID (empty string for development mode - returns conversations with empty/null user_id)
+            user_id: User ID ("anonymous" for unauthenticated users)
             limit: Maximum number of conversations
         
         Returns:
@@ -439,14 +448,17 @@ class CosmosDBService:
         """
         await self.initialize()
         
-        # Get conversations with messages to extract title and last message
-        # In development mode (empty user_id), get conversations where user_id is empty, null, or not set
-        if user_id:
-            # Production mode: get conversations for the authenticated user
+        # For anonymous users, also include conversations with empty/null/undefined user_id
+        # This handles legacy data before "anonymous" was used as the default
+        if user_id == "anonymous":
             query = """
-                SELECT TOP @limit c.id, c.user_id, c.updated_at, c.messages, c.brief
+                SELECT TOP @limit c.id, c.userId, c.user_id, c.updated_at, c.messages, c.brief, c.metadata
                 FROM c 
-                WHERE c.user_id = @user_id
+                WHERE c.userId = @user_id
+                   OR c.user_id = @user_id 
+                   OR c.user_id = "" 
+                   OR c.user_id = null 
+                   OR NOT IS_DEFINED(c.user_id)
                 ORDER BY c.updated_at DESC
             """
             params = [
@@ -454,14 +466,14 @@ class CosmosDBService:
                 {"name": "@limit", "value": limit}
             ]
         else:
-            # Development mode: get conversations where user_id is empty, null, or not defined
             query = """
-                SELECT TOP @limit c.id, c.user_id, c.updated_at, c.messages, c.brief
+                SELECT TOP @limit c.id, c.userId, c.user_id, c.updated_at, c.messages, c.brief, c.metadata
                 FROM c 
-                WHERE (NOT IS_DEFINED(c.user_id) OR c.user_id = null OR c.user_id = "")
+                WHERE c.userId = @user_id OR c.user_id = @user_id
                 ORDER BY c.updated_at DESC
             """
             params = [
+                {"name": "@user_id", "value": user_id},
                 {"name": "@limit", "value": limit}
             ]
         
@@ -472,16 +484,21 @@ class CosmosDBService:
         ):
             messages = item.get("messages", [])
             brief = item.get("brief", {})
+            metadata = item.get("metadata", {})
             
-            # Extract title from brief overview or first user message
-            title = "Untitled Conversation"
-            if brief and brief.get("overview"):
+            custom_title = metadata.get("custom_title") if metadata else None
+            if custom_title:
+                title = custom_title
+            elif brief and brief.get("overview"):
                 title = brief["overview"][:50]
             elif messages:
+                title = "Untitled Conversation"
                 for msg in messages:
                     if msg.get("role") == "user":
                         title = msg.get("content", "")[:50]
                         break
+            else:
+                title = "Untitled Conversation"
             
             # Get last message preview
             last_message = ""
@@ -516,31 +533,58 @@ class CosmosDBService:
         """
         await self.initialize()
         
+        # Get the conversation to find its partition key value
+        conversation = await self.get_conversation(conversation_id, user_id)
+        if not conversation:
+            # Already doesn't exist, consider it deleted
+            return True
+        
+        # Use userId (camelCase) as partition key, fallback to user_id for old documents
+        partition_key = conversation.get("userId") or conversation.get("user_id") or user_id
+        
         try:
-            # First try to delete with provided user_id
             await self._conversations_container.delete_item(
                 item=conversation_id,
-                partition_key=user_id
+                partition_key=partition_key
             )
+            logger.info(f"Deleted conversation {conversation_id} with partition key: {partition_key}")
             return True
-        except Exception:
-            pass
-        
-        # Fallback: find the conversation first to get the correct partition key
-        try:
-            conversation = await self.get_conversation(conversation_id, user_id)
-            if conversation:
-                actual_user_id = conversation.get("user_id", "")
-                await self._conversations_container.delete_item(
-                    item=conversation_id,
-                    partition_key=actual_user_id
-                )
-                return True
         except Exception as e:
             logger.warning(f"Failed to delete conversation {conversation_id}: {e}")
             raise
+    
+    async def rename_conversation(
+        self,
+        conversation_id: str,
+        user_id: str,
+        new_title: str
+    ) -> Optional[dict]:
+        """
+        Rename a conversation by setting a custom title in metadata.
         
-        return False
+        Args:
+            conversation_id: Unique conversation identifier
+            user_id: User ID for partition key
+            new_title: New title for the conversation
+        
+        Returns:
+            Updated conversation document or None if not found
+        """
+        await self.initialize()
+        
+        conversation = await self.get_conversation(conversation_id, user_id)
+        if not conversation:
+            return None
+        
+        conversation["metadata"] = conversation.get("metadata", {})
+        conversation["metadata"]["custom_title"] = new_title
+        # Ensure userId is set (for partition key) - migrate old documents
+        if not conversation.get("userId"):
+            conversation["userId"] = conversation.get("user_id") or user_id
+        # Don't update updated_at - renaming shouldn't change sort order
+        
+        result = await self._conversations_container.upsert_item(conversation)
+        return result
 
 
 # Singleton instance

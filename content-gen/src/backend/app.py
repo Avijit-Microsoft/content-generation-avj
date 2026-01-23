@@ -11,7 +11,7 @@ import logging
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 from quart import Quart, request, jsonify, Response
 from quart_cors import cors
@@ -49,14 +49,14 @@ def get_authenticated_user():
     Get the authenticated user from EasyAuth headers.
     
     In production (with App Service Auth), the X-Ms-Client-Principal-Id header
-    contains the user's ID. In development mode, returns empty/None values.
+    contains the user's ID. In development mode, returns "anonymous".
     """
     user_principal_id = request.headers.get("X-Ms-Client-Principal-Id", "")
     user_name = request.headers.get("X-Ms-Client-Principal-Name", "")
     auth_provider = request.headers.get("X-Ms-Client-Principal-Idp", "")
     
     return {
-        "user_principal_id": user_principal_id or "",
+        "user_principal_id": user_principal_id or "anonymous",
         "user_name": user_name or "",
         "auth_provider": auth_provider or "",
         "is_authenticated": bool(user_principal_id)
@@ -216,7 +216,33 @@ async def parse_brief():
         logger.warning(f"Failed to save brief message to CosmosDB: {e}")
     
     orchestrator = get_orchestrator()
-    parsed_brief, clarifying_questions = await orchestrator.parse_brief(brief_text)
+    parsed_brief, clarifying_questions, rai_blocked = await orchestrator.parse_brief(brief_text)
+    
+    # Check if request was blocked due to harmful content
+    if rai_blocked:
+        # Save the refusal as assistant response
+        try:
+            cosmos_service = await get_cosmos_service()
+            await cosmos_service.add_message_to_conversation(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                message={
+                    "role": "assistant",
+                    "content": clarifying_questions,  # This is the refusal message
+                    "agent": "ContentSafety",
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Failed to save RAI response to CosmosDB: {e}")
+        
+        return jsonify({
+            "rai_blocked": True,
+            "requires_clarification": False,
+            "requires_confirmation": False,
+            "conversation_id": conversation_id,
+            "message": clarifying_questions
+        })
     
     # Check if we need clarifying questions
     if clarifying_questions:
@@ -426,8 +452,6 @@ async def select_products():
 async def _run_generation_task(task_id: str, brief: CreativeBrief, products_data: list, 
                                 generate_images: bool, conversation_id: str, user_id: str):
     """Background task to run content generation."""
-    global _generation_tasks
-    
     try:
         logger.info(f"Starting background generation task {task_id}")
         _generation_tasks[task_id]["status"] = "running"
@@ -472,15 +496,13 @@ async def _run_generation_task(task_id: str, brief: CreativeBrief, products_data
         # Save to CosmosDB
         try:
             cosmos_service = await get_cosmos_service()
-            text_content = response.get("text_content", {})
-            headline = text_content.get("headline", "") if isinstance(text_content, dict) else ""
             
             await cosmos_service.add_message_to_conversation(
                 conversation_id=conversation_id,
                 user_id=user_id,
                 message={
                     "role": "assistant",
-                    "content": f"Content generated successfully!{' Headline: ' + headline if headline else ''}",
+                    "content": "Content generated successfully.",
                     "agent": "ContentAgent",
                     "timestamp": datetime.now(timezone.utc).isoformat()
                 }
@@ -705,14 +727,12 @@ async def generate_content():
             
             # Send keepalive heartbeats every 15 seconds while generation is running
             heartbeat_count = 0
-            response = None
-            error = None
             
             while not generation_task.done():
                 # Check every 0.5 seconds (faster response to completion)
                 for _ in range(30):  # 30 * 0.5s = 15 seconds
                     if generation_task.done():
-                        logger.info(f"Task completed during heartbeat wait (iteration)")
+                        logger.info("Task completed during heartbeat wait (iteration)")
                         break
                     await asyncio.sleep(0.5)
                 
@@ -784,8 +804,6 @@ async def generate_content():
             # Save generated content to conversation
             try:
                 cosmos_service = await get_cosmos_service()
-                text_content = response.get("text_content", {})
-                headline = text_content.get("headline", "") if isinstance(text_content, dict) else ""
                 
                 # Save the message
                 await cosmos_service.add_message_to_conversation(
@@ -793,7 +811,7 @@ async def generate_content():
                     user_id=user_id,
                     message={
                         "role": "assistant",
-                        "content": f"Content generated successfully!{' Headline: ' + headline if headline else ''}",
+                        "content": "Content generated successfully.",
                         "agent": "ContentAgent",
                         "timestamp": datetime.now(timezone.utc).isoformat()
                     }
@@ -886,6 +904,16 @@ async def proxy_product_image(filename: str):
         
         blob_client = blob_service._product_images_container.get_blob_client(filename)
         
+        # Get blob properties for ETag/Last-Modified
+        properties = await blob_client.get_blob_properties()
+        etag = properties.etag.strip('"') if properties.etag else None
+        last_modified = properties.last_modified
+        
+        # Check If-None-Match header for cache validation
+        if_none_match = request.headers.get("If-None-Match")
+        if if_none_match and etag and if_none_match.strip('"') == etag:
+            return Response(status=304)  # Not Modified
+        
         # Download the blob
         download = await blob_client.download_blob()
         image_data = await download.readall()
@@ -893,12 +921,18 @@ async def proxy_product_image(filename: str):
         # Determine content type from filename
         content_type = "image/png" if filename.endswith(".png") else "image/jpeg"
         
+        headers = {
+            "Cache-Control": "public, max-age=300, must-revalidate",  # Cache 5 min, revalidate
+        }
+        if etag:
+            headers["ETag"] = f'"{etag}"'
+        if last_modified:
+            headers["Last-Modified"] = last_modified.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        
         return Response(
             image_data,
             mimetype=content_type,
-            headers={
-                "Cache-Control": "public, max-age=86400",  # Cache for 24 hours
-            }
+            headers=headers
         )
     except Exception as e:
         logger.exception(f"Error proxying product image {filename}: {e}")
@@ -1051,14 +1085,13 @@ async def list_conversations():
     List conversations for a user.
     
     Uses authenticated user from EasyAuth headers. In development mode
-    (when not authenticated), returns conversations where user_id is empty/null.
+    (when not authenticated), uses "anonymous" as user_id.
     
     Query params:
         limit: Max number of results (default 20)
     """
-    # Get authenticated user from headers
     auth_user = get_authenticated_user()
-    user_id = auth_user["user_principal_id"]  # Empty string if not authenticated
+    user_id = auth_user["user_principal_id"]
     
     limit = int(request.args.get("limit", 20))
     
@@ -1109,6 +1142,38 @@ async def delete_conversation(conversation_id: str):
         return jsonify({"error": "Failed to delete conversation"}), 500
 
 
+@app.route("/api/conversations/<conversation_id>", methods=["PUT"])
+async def update_conversation(conversation_id: str):
+    """
+    Update a conversation (rename).
+    
+    Uses authenticated user from EasyAuth headers.
+    
+    Request body:
+    {
+        "title": "New conversation title"
+    }
+    """
+    auth_user = get_authenticated_user()
+    user_id = auth_user["user_principal_id"]
+    
+    data = await request.get_json()
+    new_title = data.get("title", "").strip()
+    
+    if not new_title:
+        return jsonify({"error": "Title is required"}), 400
+    
+    try:
+        cosmos_service = await get_cosmos_service()
+        result = await cosmos_service.rename_conversation(conversation_id, user_id, new_title)
+        if result:
+            return jsonify({"success": True, "message": "Conversation renamed", "title": new_title})
+        return jsonify({"error": "Conversation not found"}), 404
+    except Exception as e:
+        logger.warning(f"Failed to rename conversation: {e}")
+        return jsonify({"error": "Failed to rename conversation"}), 500
+
+
 # ==================== Brand Guidelines Endpoints ====================
 
 @app.route("/api/brand-guidelines", methods=["GET"])
@@ -1150,7 +1215,7 @@ async def startup():
     logger.info("Starting Content Generation Solution Accelerator...")
     
     # Initialize orchestrator
-    orchestrator = get_orchestrator()
+    get_orchestrator()
     logger.info("Orchestrator initialized with Microsoft Agent Framework")
     
     # Try to initialize services - they may fail if CosmosDB/Blob storage is not accessible
