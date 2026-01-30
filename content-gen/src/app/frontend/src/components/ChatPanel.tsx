@@ -113,7 +113,7 @@ export function ChatPanel({
         }}
       >
         {showWelcome ? (
-          <WelcomeCard onSuggestionClick={handleSuggestionClick} />
+          <WelcomeCard onSuggestionClick={handleSuggestionClick} currentInput={inputValue} />
         ) : (
           <>
             {messages.map((message) => (
@@ -149,6 +149,7 @@ export function ChatPanel({
                 onStartOver={onProductsStartOver || (() => {})}
                 isAwaitingResponse={isLoading}
                 onProductSelect={onProductSelect}
+                disabled={isLoading}
               />
             )}
             

@@ -15,6 +15,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { ChatPanel } from './components/ChatPanel';
 import { ChatHistory } from './components/ChatHistory';
 import type { ChatMessage, CreativeBrief, Product, GeneratedContent } from './types';
+import ContosoLogo from './styles/images/contoso.svg';
 
 interface UserInfo {
   user_principal_id: string;
@@ -23,16 +24,6 @@ interface UserInfo {
   is_authenticated: boolean;
 }
 
-// Contoso logo SVG component
-function ContosoLogo() {
-  return (
-    <svg width="28" height="28" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <path d="M14 0L28 14L14 28L0 14L14 0Z" fill="#0078D4"/>
-      <path d="M14 4L24 14L14 24L4 14L14 4Z" fill="#50E6FF"/>
-      <path d="M14 8L20 14L14 20L8 14L14 8Z" fill="white"/>
-    </svg>
-  );
-}
 
 function App() {
   const [conversationId, setConversationId] = useState<string>(() => uuidv4());
@@ -301,6 +292,124 @@ function App() {
           timestamp: new Date().toISOString(),
         };
         setMessages(prev => [...prev, assistantMessage]);
+      } else if (generatedContent && confirmedBrief) {
+        // Content has been generated - check if user wants to modify the image
+        const imageModificationKeywords = [
+          'change', 'modify', 'update', 'replace', 'show', 'display', 'use', 
+          'instead', 'different', 'another', 'make it', 'make the', 
+          'kitchen', 'dining', 'living', 'bedroom', 'bathroom', 'outdoor', 'office',
+          'room', 'scene', 'setting', 'background', 'style', 'color', 'lighting'
+        ];
+        const isImageModification = imageModificationKeywords.some(kw => content.toLowerCase().includes(kw));
+        
+        if (isImageModification) {
+          // User wants to modify the image - use regeneration endpoint
+          const { streamRegenerateImage } = await import('./api');
+          
+          setGenerationStatus('Regenerating image with your changes...');
+          
+          let responseData: GeneratedContent | null = null;
+          let messageContent = '';
+          
+          // Get previous prompt from image_content if available
+          const previousPrompt = generatedContent.image_content?.prompt_used;
+          
+          for await (const response of streamRegenerateImage(
+            content,
+            confirmedBrief,
+            selectedProducts,
+            previousPrompt,
+            conversationId,
+            userId,
+            signal
+          )) {
+            if (response.type === 'heartbeat') {
+              setGenerationStatus(response.message || 'Regenerating image...');
+            } else if (response.type === 'agent_response' && response.is_final) {
+              try {
+                const parsedContent = JSON.parse(response.content);
+                
+                // Update generatedContent with new image
+                if (parsedContent.image_url || parsedContent.image_base64) {
+                  responseData = {
+                    ...generatedContent,
+                    image_content: {
+                      ...generatedContent.image_content,
+                      image_url: parsedContent.image_url || generatedContent.image_content?.image_url,
+                      image_base64: parsedContent.image_base64,
+                      prompt_used: parsedContent.image_prompt || generatedContent.image_content?.prompt_used,
+                    },
+                  };
+                  setGeneratedContent(responseData);
+                  
+                  // Update the confirmed brief to include the modification
+                  // This ensures subsequent "Regenerate" clicks use the updated visual guidelines
+                  const updatedBrief = {
+                    ...confirmedBrief,
+                    visual_guidelines: `${confirmedBrief.visual_guidelines}. User modification: ${content}`,
+                  };
+                  setConfirmedBrief(updatedBrief);
+                  
+                  messageContent = parsedContent.message || 'Image regenerated with your requested changes.';
+                } else if (parsedContent.error) {
+                  messageContent = parsedContent.error;
+                } else {
+                  messageContent = parsedContent.message || 'I processed your request.';
+                }
+              } catch {
+                messageContent = response.content || 'Image regenerated.';
+              }
+            } else if (response.type === 'error') {
+              messageContent = response.content || 'An error occurred while regenerating the image.';
+            }
+          }
+          
+          setGenerationStatus('');
+          
+          const assistantMessage: ChatMessage = {
+            id: uuidv4(),
+            role: 'assistant',
+            content: messageContent,
+            agent: 'ImageAgent',
+            timestamp: new Date().toISOString(),
+          };
+          setMessages(prev => [...prev, assistantMessage]);
+        } else {
+          // General question after content generation - use regular chat
+          let fullContent = '';
+          let currentAgent = '';
+          let messageAdded = false;
+          
+          setGenerationStatus('Processing your request...');
+          for await (const response of streamChat(content, conversationId, userId, signal)) {
+            if (response.type === 'agent_response') {
+              fullContent = response.content;
+              currentAgent = response.agent || '';
+              
+              if ((response.is_final || response.requires_user_input) && !messageAdded) {
+                const assistantMessage: ChatMessage = {
+                  id: uuidv4(),
+                  role: 'assistant',
+                  content: fullContent,
+                  agent: currentAgent,
+                  timestamp: new Date().toISOString(),
+                };
+                setMessages(prev => [...prev, assistantMessage]);
+                messageAdded = true;
+              }
+            } else if (response.type === 'error') {
+              const errorMessage: ChatMessage = {
+                id: uuidv4(),
+                role: 'assistant',
+                content: response.content || 'An error occurred.',
+                timestamp: new Date().toISOString(),
+              };
+              setMessages(prev => [...prev, errorMessage]);
+              messageAdded = true;
+            }
+          }
+          setGenerationStatus('');
+        }
       } else {
         // Check if this looks like a creative brief
         const briefKeywords = ['campaign', 'marketing', 'target audience', 'objective', 'deliverable'];
@@ -640,7 +749,7 @@ function App() {
         flexShrink: 0,
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 'clamp(8px, 1.5vw, 10px)' }}>
-          <ContosoLogo />
+          <img src={ContosoLogo} alt="Contoso" width="28" height="28" />
           <Text weight="semibold" size={500} style={{ color: tokens.colorNeutralForeground1, fontSize: 'clamp(16px, 2.5vw, 20px)' }}>
             Contoso
           </Text>
